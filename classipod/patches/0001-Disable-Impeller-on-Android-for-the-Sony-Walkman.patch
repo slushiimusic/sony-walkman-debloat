@@ -1,0 +1,38 @@
+From 4ef4751b01527d04d3eab6d1bb3f56e4b4facf27 Mon Sep 17 00:00:00 2001
+From: slushiimusic <75352846+slushiimusic@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 08:10:10 +0000
+Subject: [PATCH 1/2] =?UTF-8?q?=F0=9F=90=9B=20Disable=20Impeller=20on=20An?=
+ =?UTF-8?q?droid=20for=20the=20Sony=20Walkman?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Impeller crashes with SIGSEGV in the Vivante GC7000UL shader compiler
+(/vendor/lib64/libVSC.so, thread 1.raster) on the NW-WM1AM2, under
+both Vulkan and OpenGL ES. Rendering with Skia avoids it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vi6nrnAN1baNYA2a6uHmXt
+---
+ android/app/src/main/AndroidManifest.xml | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 0830593..4dcbb3e 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -45,6 +45,11 @@
+         <meta-data
+             android:name="flutterEmbedding"
+             android:value="2" />
++        <!-- Impeller crashes in the Vivante GC7000UL shader compiler
++             (libVSC.so) on the Sony NW-WM1AM2, so render with Skia. -->
++        <meta-data
++            android:name="io.flutter.embedding.android.EnableImpeller"
++            android:value="false" />
+         <!-- ADD THIS "SERVICE" element -->
+         <service
+             android:name="com.ryanheise.audioservice.AudioService"
+-- 
+2.43.0
+

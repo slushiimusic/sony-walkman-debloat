@@ -1,0 +1,1969 @@
+From 900c366875bfbb8aeb8d05cbf26ba5df4d4a0120 Mon Sep 17 00:00:00 2001
+From: slushiimusic <75352846+slushiimusic@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 08:10:21 +0000
+Subject: [PATCH 2/2] =?UTF-8?q?=F0=9F=90=9B=20Fix=20charging=20indicator?=
+ =?UTF-8?q?=20and=20add=20Battery=20settings=20on=20Android?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The status bar showed the charging bolt from battery_plus, which asks
+the battery HAL for BATTERY_PROPERTY_STATUS and ignores whether a
+charger is attached. It also only re-read the level when that status
+changed.
+
+Read the sticky ACTION_BATTERY_CHANGED broadcast instead, through a
+small local plugin (packages/classipod_power), the same source the
+system status bar uses:
+- nothing plugged in is never charging, whatever the status says;
+- plugged in but the level falling, or not rising for 15 minutes,
+  counts as not charging (Battery Care hold, or a USB port weaker
+  than the screen's draw);
+- with Sony's Battery Care on, 90% and above counts as not charging;
+- the level updates on every broadcast.
+
+Add Settings > Battery (Android only) so power settings that were
+being changed over adb live in the app:
+- Status, opening the system battery usage page;
+- Battery Saver (global low_power);
+- Battery Care: the settings tables are scanned for Sony's switch,
+  which isn't documented; if it can't be found or written, the item
+  opens the system Battery page;
+- Bluetooth Scanning (global ble_scan_always_enabled);
+- Screen Timeout (system screen_off_timeout).
+
+Android only lets third-party apps write these after a one-time
+`adb shell pm grant <package> android.permission.WRITE_SECURE_SETTINGS`;
+until then the screen shows an Allow Changes item explaining it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vi6nrnAN1baNYA2a6uHmXt
+---
+ android/app/src/main/AndroidManifest.xml      |   6 +
+ lib/core/navigation/routes.dart               |  11 +
+ .../menu/models/split_screen_type.dart        |   7 +
+ .../screens/split_screen_placeholder.dart     |  50 ++++
+ .../battery_settings_controller.dart          | 160 +++++++++++
+ .../models/battery_settings_model.dart        |  80 ++++++
+ .../screens/battery_settings_screen.dart      | 237 +++++++++++++++++
+ .../screens/settings_preferences_screen.dart  |  23 +-
+ .../controller/battery_controller.dart        | 100 +++++--
+ .../model/android_battery_state.dart          |  67 +++++
+ .../widgets/device_screen_content.dart        |   1 +
+ lib/l10n/app_en.arb                           | 108 ++++++++
+ .../classipod_power/android/build.gradle.kts  |  68 +++++
+ .../android/settings.gradle.kts               |   1 +
+ .../android/src/main/AndroidManifest.xml      |   1 +
+ .../classipod/power/ClassipodPowerPlugin.kt   | 248 ++++++++++++++++++
+ .../classipod_power/lib/classipod_power.dart  | 173 ++++++++++++
+ packages/classipod_power/pubspec.yaml         |  19 ++
+ pubspec.lock                                  |   7 +
+ pubspec.yaml                                  |   2 +
+ .../settings/battery_care_setting_test.dart   |  62 +++++
+ .../android_battery_state_test.dart           | 203 ++++++++++++++
+ 22 files changed, 1617 insertions(+), 17 deletions(-)
+ create mode 100644 lib/features/settings/controller/battery_settings_controller.dart
+ create mode 100644 lib/features/settings/models/battery_settings_model.dart
+ create mode 100644 lib/features/settings/screens/battery_settings_screen.dart
+ create mode 100644 lib/features/status_bar/model/android_battery_state.dart
+ create mode 100644 packages/classipod_power/android/build.gradle.kts
+ create mode 100644 packages/classipod_power/android/settings.gradle.kts
+ create mode 100644 packages/classipod_power/android/src/main/AndroidManifest.xml
+ create mode 100644 packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt
+ create mode 100644 packages/classipod_power/lib/classipod_power.dart
+ create mode 100644 packages/classipod_power/pubspec.yaml
+ create mode 100644 test/unit_tests/features/settings/battery_care_setting_test.dart
+ create mode 100644 test/unit_tests/features/status_bar/android_battery_state_test.dart
+
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 4dcbb3e..e7794b2 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -11,6 +11,12 @@
+ 
+     <uses-permission android:name="android.permission.INTERNET" />
+ 
++    <!-- Battery settings screen. Granted once over adb:
++         adb shell pm grant com.adeeteya.classipod android.permission.WRITE_SECURE_SETTINGS -->
++    <uses-permission
++        android:name="android.permission.WRITE_SECURE_SETTINGS"
++        tools:ignore="ProtectedPermissions" />
++
+     <application
+         android:networkSecurityConfig="@xml/network_security_config"
+         android:allowBackup="false"
+diff --git a/lib/core/navigation/routes.dart b/lib/core/navigation/routes.dart
+index d7d1493..8b1076b 100644
+--- a/lib/core/navigation/routes.dart
++++ b/lib/core/navigation/routes.dart
+@@ -33,6 +33,7 @@ import 'package:classipod/features/now_playing/widgets/now_playing_idle_navigati
+ import 'package:classipod/features/settings/controller/exclude_directories_controller.dart';
+ import 'package:classipod/features/settings/controller/settings_preferences_controller.dart';
+ import 'package:classipod/features/settings/screens/about_screen.dart';
++import 'package:classipod/features/settings/screens/battery_settings_screen.dart';
+ import 'package:classipod/features/settings/screens/device_color_selection_screen.dart';
+ import 'package:classipod/features/settings/screens/exclude_directories_screen.dart';
+ import 'package:classipod/features/settings/screens/language_selection_screen.dart';
+@@ -52,6 +53,7 @@ enum Routes {
+   menu,
+   settings,
+   librarySettings,
++  batterySettings,
+   about,
+   language,
+   deviceColor,
+@@ -97,6 +99,8 @@ enum Routes {
+         return context.localization.settingsScreenTitle;
+       case librarySettings:
+         return context.localization.librarySettingsScreenTitle;
++      case batterySettings:
++        return context.localization.batterySettingsScreenTitle;
+       case about:
+         return context.localization.aboutScreenTitle;
+       case language:
+@@ -262,6 +266,13 @@ final routerProvider = Provider(
+                           child: DeviceColorSelectionScreen(),
+                         ),
+                       ),
++                      GoRoute(
++                        path: Routes.batterySettings.name,
++                        name: Routes.batterySettings.name,
++                        parentNavigatorKey: menuNavigatorKey,
++                        pageBuilder: (context, state) =>
++                            const CupertinoPage(child: BatterySettingsScreen()),
++                      ),
+                       GoRoute(
+                         path: Routes.librarySettings.name,
+                         name: Routes.librarySettings.name,
+diff --git a/lib/features/menu/models/split_screen_type.dart b/lib/features/menu/models/split_screen_type.dart
+index 6f74c03..6f3b46d 100644
+--- a/lib/features/menu/models/split_screen_type.dart
++++ b/lib/features/menu/models/split_screen_type.dart
+@@ -24,6 +24,13 @@ enum SplitScreenType {
+   showTutorialScreen,
+   rescanMusicFiles,
+   refreshLibrary,
++  batterySettings,
++  batteryStatus,
++  batterySaver,
++  batteryCare,
++  bluetoothScanning,
++  screenTimeout,
++  allowSystemChanges,
+   excludeDirectories,
+   resetSettings,
+   donate,
+diff --git a/lib/features/menu/screens/split_screen_placeholder.dart b/lib/features/menu/screens/split_screen_placeholder.dart
+index 9f81e6f..866bd6e 100644
+--- a/lib/features/menu/screens/split_screen_placeholder.dart
++++ b/lib/features/menu/screens/split_screen_placeholder.dart
+@@ -11,9 +11,11 @@ import 'package:classipod/features/menu/widgets/now_playing_preview_widget.dart'
+ import 'package:classipod/features/menu/widgets/settings_preview_widget.dart';
+ import 'package:classipod/features/menu/widgets/split_screen_preview_transition.dart';
+ import 'package:classipod/features/music/songs/provider/songs_provider.dart';
++import 'package:classipod/features/settings/controller/battery_settings_controller.dart';
+ import 'package:classipod/features/settings/controller/settings_preferences_controller.dart';
+ import 'package:classipod/features/settings/widgets/subsonic_dialog.dart';
+ import 'package:classipod/features/sleep_timer/widgets/sleep_timer_preview_widget.dart';
++import 'package:classipod/features/status_bar/controller/battery_controller.dart';
+ import 'package:classipod/features/status_bar/widgets/screen_page_content.dart';
+ import 'package:cupertino_ui/cupertino_ui.dart';
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+@@ -267,6 +269,54 @@ class _SplitScreenPlaceholderState extends ConsumerState<SplitScreenPlaceholder>
+           icon: CupertinoIcons.refresh_circled,
+           contentText: "",
+         );
++      } else if (splitScreenType == SplitScreenType.batterySettings) {
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.batterySettingsScreenTitle,
++          icon: CupertinoIcons.battery_75_percent,
++          contentText: context.localization.batterySettingsDescription,
++        );
++      } else if (splitScreenType == SplitScreenType.batteryStatus) {
++        final battery = ref.watch(batteryDetailsControllerProvider).value;
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.batteryStatusTitle,
++          icon: CupertinoIcons.battery_charging,
++          contentText: battery == null
++              ? ""
++              : context.localization.batteryStatusDescription(battery.level),
++        );
++      } else if (splitScreenType == SplitScreenType.batterySaver) {
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.batterySaverTitle,
++          icon: CupertinoIcons.battery_25_percent,
++          contentText: context.localization.batterySaverDescription,
++        );
++      } else if (splitScreenType == SplitScreenType.batteryCare) {
++        final settings = ref.watch(batterySettingsControllerProvider).value;
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.batteryCareTitle,
++          icon: CupertinoIcons.heart_fill,
++          contentText: settings?.batteryCare == null
++              ? context.localization.batteryCareOpensSystemDescription
++              : context.localization.batteryCareDescription,
++        );
++      } else if (splitScreenType == SplitScreenType.bluetoothScanning) {
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.bluetoothScanningTitle,
++          icon: CupertinoIcons.bluetooth,
++          contentText: context.localization.bluetoothScanningDescription,
++        );
++      } else if (splitScreenType == SplitScreenType.screenTimeout) {
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.screenTimeoutTitle,
++          icon: CupertinoIcons.timer,
++          contentText: context.localization.screenTimeoutDescription,
++        );
++      } else if (splitScreenType == SplitScreenType.allowSystemChanges) {
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.allowSystemChangesTitle,
++          icon: CupertinoIcons.lock_open,
++          contentText: "",
++        );
+       } else if (splitScreenType == SplitScreenType.donate) {
+         splitScreenWidget = IconPreviewWidget(
+           titleText: context.localization.donateSettingTitle,
+diff --git a/lib/features/settings/controller/battery_settings_controller.dart b/lib/features/settings/controller/battery_settings_controller.dart
+new file mode 100644
+index 0000000..47bc53f
+--- /dev/null
++++ b/lib/features/settings/controller/battery_settings_controller.dart
+@@ -0,0 +1,160 @@
++import 'dart:io';
++
++import 'package:classipod/features/settings/models/battery_settings_model.dart';
++import 'package:classipod_power/classipod_power.dart';
++import 'package:flutter/foundation.dart';
++import 'package:flutter/services.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++
++enum SystemSettingChange { done, needsPermission, openedSystemScreen, failed }
++
++final batterySettingsControllerProvider =
++    AsyncNotifierProvider<BatterySettingsController, BatterySettingsModel>(
++      BatterySettingsController.new,
++    );
++
++/// Sony's Battery Care stops charging at about 90%.
++final batteryCareChargeLimitProvider = Provider<int?>((ref) {
++  if (kIsWeb || !Platform.isAndroid) return null;
++  final settings = ref.watch(batterySettingsControllerProvider).value;
++  return settings?.batteryCare == true ? 90 : null;
++});
++
++class BatterySettingsController extends AsyncNotifier<BatterySettingsModel> {
++  static const _batterySaver = SystemSetting.global('low_power');
++  static const _bluetoothScanning = SystemSetting.global(
++    'ble_scan_always_enabled',
++  );
++  static const _screenTimeout = SystemSetting.system('screen_off_timeout');
++
++  /// Sony doesn't document where Battery Care lives, so look for it.
++  static const batteryCarePattern =
++      r'batt(ery)?[^a-z]?care|charg(e|ing)[^a-z]?(limit|care)|'
++      r'battery[^a-z]?protect';
++
++  static const screenTimeouts = [
++    Duration(seconds: 15),
++    Duration(seconds: 30),
++    Duration(minutes: 1),
++    Duration(minutes: 2),
++    Duration(minutes: 5),
++    Duration(minutes: 10),
++  ];
++
++  @override
++  Future<BatterySettingsModel> build() async {
++    final values = await ClassipodPower.getSettings([
++      _bluetoothScanning,
++      _screenTimeout,
++    ]);
++    final batteryCare = pickBatteryCareSetting(
++      await ClassipodPower.findSettings(batteryCarePattern),
++    );
++    final timeout = int.tryParse(values[_screenTimeout] ?? '');
++    return BatterySettingsModel(
++      packageName: await ClassipodPower.packageName(),
++      canWriteSettings: await ClassipodPower.canWriteSecureSettings(),
++      batterySaver: await ClassipodPower.isPowerSaveMode(),
++      batteryCareSetting: batteryCare?.key,
++      batteryCare: batteryCare == null ? null : batteryCare.value == '1',
++      bluetoothScanning: values[_bluetoothScanning] != '0',
++      screenTimeout: timeout == null ? null : Duration(milliseconds: timeout),
++    );
++  }
++
++  Future<SystemSettingChange> toggleBatterySaver() async {
++    final current = await future;
++    final enabled = !current.batterySaver;
++    return _write(
++      _batterySaver,
++      enabled ? '1' : '0',
++      current.copyWith(batterySaver: enabled),
++    );
++  }
++
++  /// Flips the setting found by the scan. Otherwise, or when the system
++  /// refuses the write, opens Sony's Battery page instead.
++  Future<SystemSettingChange> toggleBatteryCare() async {
++    final current = await future;
++    final setting = current.batteryCareSetting;
++    final enabled = current.batteryCare;
++    if (setting == null || enabled == null) return _openBatteryScreen();
++    final result = await _write(
++      setting,
++      enabled ? '0' : '1',
++      current.copyWith(batteryCare: !enabled),
++    );
++    if (result == SystemSettingChange.needsPermission &&
++        setting.namespace == 'system') {
++      // Private keys in the system table stay read-only to apps, even
++      // with the adb grant.
++      return _openBatteryScreen();
++    }
++    return result;
++  }
++
++  Future<SystemSettingChange> toggleBluetoothScanning() async {
++    final current = await future;
++    final enabled = !current.bluetoothScanning;
++    return _write(
++      _bluetoothScanning,
++      enabled ? '1' : '0',
++      current.copyWith(bluetoothScanning: enabled),
++    );
++  }
++
++  Future<SystemSettingChange> cycleScreenTimeout() async {
++    final current = await future;
++    final index = screenTimeouts.indexOf(
++      current.screenTimeout ?? Duration.zero,
++    );
++    final next = screenTimeouts[(index + 1) % screenTimeouts.length];
++    return _write(
++      _screenTimeout,
++      next.inMilliseconds.toString(),
++      current.copyWith(screenTimeout: next),
++    );
++  }
++
++  Future<void> openBatteryUsage() => ClassipodPower.openSystemScreen('battery');
++
++  Future<SystemSettingChange> _openBatteryScreen() async {
++    return await ClassipodPower.openSystemScreen('battery')
++        ? SystemSettingChange.openedSystemScreen
++        : SystemSettingChange.failed;
++  }
++
++  /// Shows [updated] straight away: the system applies some settings
++  /// asynchronously, and the screen re-reads everything on resume.
++  Future<SystemSettingChange> _write(
++    SystemSetting setting,
++    String value,
++    BatterySettingsModel updated,
++  ) async {
++    try {
++      if (!await ClassipodPower.putSetting(setting, value)) {
++        return SystemSettingChange.failed;
++      }
++    } on PlatformException catch (e) {
++      return e.code == 'PERMISSION_DENIED'
++          ? SystemSettingChange.needsPermission
++          : SystemSettingChange.failed;
++    }
++    state = AsyncData(updated);
++    return SystemSettingChange.done;
++  }
++}
++
++/// The likeliest Battery Care switch among [found]: an on/off value, and
++/// preferably a name that says "care".
++MapEntry<SystemSetting, String?>? pickBatteryCareSetting(
++  Map<SystemSetting, String?> found,
++) {
++  final switches = found.entries
++      .where((entry) => entry.value == '0' || entry.value == '1')
++      .toList();
++  for (final entry in switches) {
++    if (entry.key.key.toLowerCase().contains('care')) return entry;
++  }
++  return switches.isEmpty ? null : switches.first;
++}
+diff --git a/lib/features/settings/models/battery_settings_model.dart b/lib/features/settings/models/battery_settings_model.dart
+new file mode 100644
+index 0000000..97e2db1
+--- /dev/null
++++ b/lib/features/settings/models/battery_settings_model.dart
+@@ -0,0 +1,80 @@
++import 'package:classipod_power/classipod_power.dart';
++
++class BatterySettingsModel {
++  const BatterySettingsModel({
++    required this.packageName,
++    required this.canWriteSettings,
++    required this.batterySaver,
++    required this.batteryCareSetting,
++    required this.batteryCare,
++    required this.bluetoothScanning,
++    required this.screenTimeout,
++  });
++
++  final String packageName;
++
++  /// Whether WRITE_SECURE_SETTINGS has been granted over adb.
++  final bool canWriteSettings;
++
++  final bool batterySaver;
++
++  /// Where this firmware stores Battery Care, if the settings scan found it.
++  final SystemSetting? batteryCareSetting;
++
++  /// Null when Battery Care could not be located.
++  final bool? batteryCare;
++
++  final bool bluetoothScanning;
++
++  final Duration? screenTimeout;
++
++  BatterySettingsModel copyWith({
++    bool? canWriteSettings,
++    bool? batterySaver,
++    bool? batteryCare,
++    bool? bluetoothScanning,
++    Duration? screenTimeout,
++  }) {
++    return BatterySettingsModel(
++      packageName: packageName,
++      canWriteSettings: canWriteSettings ?? this.canWriteSettings,
++      batterySaver: batterySaver ?? this.batterySaver,
++      batteryCareSetting: batteryCareSetting,
++      batteryCare: batteryCare ?? this.batteryCare,
++      bluetoothScanning: bluetoothScanning ?? this.bluetoothScanning,
++      screenTimeout: screenTimeout ?? this.screenTimeout,
++    );
++  }
++
++  @override
++  bool operator ==(Object other) {
++    return other is BatterySettingsModel &&
++        other.packageName == packageName &&
++        other.canWriteSettings == canWriteSettings &&
++        other.batterySaver == batterySaver &&
++        other.batteryCareSetting == batteryCareSetting &&
++        other.batteryCare == batteryCare &&
++        other.bluetoothScanning == bluetoothScanning &&
++        other.screenTimeout == screenTimeout;
++  }
++
++  @override
++  int get hashCode => Object.hash(
++    packageName,
++    canWriteSettings,
++    batterySaver,
++    batteryCareSetting,
++    batteryCare,
++    bluetoothScanning,
++    screenTimeout,
++  );
++
++  @override
++  String toString() {
++    return 'BatterySettingsModel(canWriteSettings: $canWriteSettings, '
++        'batterySaver: $batterySaver, batteryCareSetting: '
++        '$batteryCareSetting, batteryCare: $batteryCare, '
++        'bluetoothScanning: $bluetoothScanning, '
++        'screenTimeout: $screenTimeout)';
++  }
++}
+diff --git a/lib/features/settings/screens/battery_settings_screen.dart b/lib/features/settings/screens/battery_settings_screen.dart
+new file mode 100644
+index 0000000..a05a607
+--- /dev/null
++++ b/lib/features/settings/screens/battery_settings_screen.dart
+@@ -0,0 +1,237 @@
++import 'package:battery_plus/battery_plus.dart';
++import 'package:classipod/core/alerts/dialogs.dart';
++import 'package:classipod/core/extensions/build_context_extensions.dart';
++import 'package:classipod/core/extensions/go_router_extensions.dart';
++import 'package:classipod/core/navigation/routes.dart';
++import 'package:classipod/features/custom_screen_elements/custom_screen.dart';
++import 'package:classipod/features/menu/controller/split_screen_controller.dart';
++import 'package:classipod/features/menu/models/split_screen_type.dart';
++import 'package:classipod/features/settings/controller/battery_settings_controller.dart';
++import 'package:classipod/features/settings/models/battery_settings_model.dart';
++import 'package:classipod/features/settings/widgets/settings_list_tile.dart';
++import 'package:classipod/features/status_bar/controller/battery_controller.dart';
++import 'package:cupertino_ui/cupertino_ui.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++
++enum _BatterySettingsItems {
++  status,
++  batterySaver,
++  batteryCare,
++  bluetoothScanning,
++  screenTimeout,
++  allowChanges;
++
++  String title(BuildContext context) => switch (this) {
++    status => context.localization.batteryStatusTitle,
++    batterySaver => context.localization.batterySaverTitle,
++    batteryCare => context.localization.batteryCareTitle,
++    bluetoothScanning => context.localization.bluetoothScanningTitle,
++    screenTimeout => context.localization.screenTimeoutTitle,
++    allowChanges => context.localization.allowSystemChangesTitle,
++  };
++
++  SplitScreenType get preview => switch (this) {
++    status => SplitScreenType.batteryStatus,
++    batterySaver => SplitScreenType.batterySaver,
++    batteryCare => SplitScreenType.batteryCare,
++    bluetoothScanning => SplitScreenType.bluetoothScanning,
++    screenTimeout => SplitScreenType.screenTimeout,
++    allowChanges => SplitScreenType.allowSystemChanges,
++  };
++}
++
++class BatterySettingsScreen extends ConsumerStatefulWidget {
++  const BatterySettingsScreen({super.key});
++
++  @override
++  ConsumerState<BatterySettingsScreen> createState() =>
++      _BatterySettingsScreenState();
++}
++
++class _BatterySettingsScreenState extends ConsumerState<BatterySettingsScreen>
++    with CustomScreen {
++  late final AppLifecycleListener _lifecycleListener;
++  bool _handlingSetting = false;
++  List<_BatterySettingsItems> _displayItems = _BatterySettingsItems.values;
++
++  @override
++  String get routeName => Routes.batterySettings.name;
++
++  @override
++  List<_BatterySettingsItems> get displayItems => _displayItems;
++
++  @override
++  void initState() {
++    super.initState();
++    // Settings may have changed in the system Battery page.
++    _lifecycleListener = AppLifecycleListener(
++      onResume: () => ref.invalidate(batterySettingsControllerProvider),
++    );
++  }
++
++  @override
++  void dispose() {
++    _lifecycleListener.dispose();
++    super.dispose();
++  }
++
++  @override
++  Future<void> onSelectPressed() =>
++      _settingAction(displayItems[selectedDisplayItem]);
++
++  Future<void> _settingAction(_BatterySettingsItems item) async {
++    if (_handlingSetting) return;
++    _handlingSetting = true;
++    try {
++      setState(() => selectedDisplayItem = displayItems.indexOf(item));
++      final controller = ref.read(batterySettingsControllerProvider.notifier);
++      switch (item) {
++        case _BatterySettingsItems.status:
++          await controller.openBatteryUsage();
++          break;
++        case _BatterySettingsItems.batterySaver:
++          await _showResult(await controller.toggleBatterySaver());
++          break;
++        case _BatterySettingsItems.batteryCare:
++          await _showResult(await controller.toggleBatteryCare());
++          break;
++        case _BatterySettingsItems.bluetoothScanning:
++          await _showResult(await controller.toggleBluetoothScanning());
++          break;
++        case _BatterySettingsItems.screenTimeout:
++          await _showResult(await controller.cycleScreenTimeout());
++          break;
++        case _BatterySettingsItems.allowChanges:
++          await _showPermissionHelp();
++          break;
++      }
++    } finally {
++      _handlingSetting = false;
++    }
++  }
++
++  Future<void> _showResult(SystemSettingChange result) async {
++    if (!mounted) return;
++    switch (result) {
++      case SystemSettingChange.done:
++      case SystemSettingChange.openedSystemScreen:
++        break;
++      case SystemSettingChange.needsPermission:
++        await _showPermissionHelp();
++        break;
++      case SystemSettingChange.failed:
++        await Dialogs.showInfoDialog(
++          context: context,
++          title: context.localization.batterySettingsScreenTitle,
++          content: context.localization.systemSettingChangeFailed,
++        );
++        break;
++    }
++  }
++
++  Future<void> _showPermissionHelp() async {
++    final settings = await ref.read(batterySettingsControllerProvider.future);
++    if (!mounted) return;
++    await Dialogs.showInfoDialog(
++      context: context,
++      title: context.localization.allowSystemChangesTitle,
++      content: context.localization.allowSystemChangesDescription(
++        settings.packageName,
++      ),
++    );
++  }
++
++  void _changeSplitScreenType() {
++    if (!mounted || context.router.locationNamed != routeName) return;
++    ref.read(splitScreenControllerProvider.notifier).changeSplitScreenType =
++        displayItems[selectedDisplayItem].preview;
++  }
++
++  String? _statusValue(BatteryState? state) => switch (state) {
++    BatteryState.charging => context.localization.batteryStatusCharging,
++    BatteryState.full => context.localization.batteryStatusCharged,
++    BatteryState.connectedNotCharging =>
++      context.localization.batteryStatusNotCharging,
++    BatteryState.discharging => context.localization.batteryStatusOnBattery,
++    BatteryState.unknown || null => null,
++  };
++
++  String? _onOff(bool? value) {
++    if (value == null) return null;
++    return value
++        ? context.localization.tileValueOn
++        : context.localization.tileValueOff;
++  }
++
++  String? _timeoutValue(Duration? timeout) {
++    if (timeout == null) return null;
++    if (timeout.inSeconds < 60) {
++      return context.localization.screenTimeoutSeconds(timeout.inSeconds);
++    }
++    return context.localization.screenTimeoutMinutes(timeout.inMinutes);
++  }
++
++  String? _value(
++    _BatterySettingsItems item,
++    BatterySettingsModel? settings,
++    BatteryState? batteryState,
++  ) => switch (item) {
++    _BatterySettingsItems.status => _statusValue(batteryState),
++    _BatterySettingsItems.batterySaver => _onOff(settings?.batterySaver),
++    _BatterySettingsItems.batteryCare => _onOff(settings?.batteryCare),
++    _BatterySettingsItems.bluetoothScanning => _onOff(
++      settings?.bluetoothScanning,
++    ),
++    _BatterySettingsItems.screenTimeout => _timeoutValue(
++      settings?.screenTimeout,
++    ),
++    _BatterySettingsItems.allowChanges => null,
++  };
++
++  @override
++  Widget build(BuildContext context) {
++    final settings = ref.watch(batterySettingsControllerProvider).value;
++    final batteryState = ref
++        .watch(batteryDetailsControllerProvider)
++        .value
++        ?.batteryState;
++    final selectedItem = displayItems[selectedDisplayItem];
++    _displayItems = [
++      for (final item in _BatterySettingsItems.values)
++        if (item != _BatterySettingsItems.allowChanges ||
++            settings?.canWriteSettings == false)
++          item,
++    ];
++    final selectedIndex = displayItems.indexOf(selectedItem);
++    selectedDisplayItem = selectedIndex < 0 ? 0 : selectedIndex;
++    _changeSplitScreenType();
++
++    return CupertinoPageScaffold(
++      resizeToAvoidBottomInset: false,
++      child: Column(
++        children: [
++          Flexible(
++            child: CupertinoScrollbar(
++              controller: scrollController,
++              child: ListView.builder(
++                controller: scrollController,
++                itemCount: displayItems.length,
++                prototypeItem: SettingsListTile(
++                  text: '',
++                  isSelected: false,
++                  onTap: () {},
++                ),
++                itemBuilder: (context, index) => SettingsListTile(
++                  text: displayItems[index].title(context),
++                  value: _value(displayItems[index], settings, batteryState),
++                  isSelected: selectedDisplayItem == index,
++                  onTap: () async => _settingAction(displayItems[index]),
++                ),
++              ),
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/features/settings/screens/settings_preferences_screen.dart b/lib/features/settings/screens/settings_preferences_screen.dart
+index d0aee6e..50d7b12 100644
+--- a/lib/features/settings/screens/settings_preferences_screen.dart
++++ b/lib/features/settings/screens/settings_preferences_screen.dart
+@@ -1,3 +1,5 @@
++import 'dart:io';
++
+ import 'package:classipod/core/constants/constants.dart';
+ import 'package:classipod/core/extensions/build_context_extensions.dart';
+ import 'package:classipod/core/extensions/go_router_extensions.dart';
+@@ -11,6 +13,7 @@ import 'package:classipod/features/settings/controller/settings_preferences_cont
+ import 'package:classipod/features/settings/models/settings_preferences_model.dart';
+ import 'package:classipod/features/settings/widgets/settings_list_tile.dart';
+ import 'package:cupertino_ui/cupertino_ui.dart';
++import 'package:flutter/foundation.dart';
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:go_router/go_router.dart';
+ import 'package:url_launcher/url_launcher.dart';
+@@ -33,6 +36,7 @@ enum _SettingsDisplayItems {
+   immersiveMode,
+   showAppTutorial,
+   librarySettings,
++  battery,
+   resetSettings,
+   donate;
+ 
+@@ -72,6 +76,8 @@ enum _SettingsDisplayItems {
+         return context.localization.showAppTutorialSettingTitle;
+       case librarySettings:
+         return context.localization.librarySettingsScreenTitle;
++      case battery:
++        return context.localization.batterySettingsScreenTitle;
+       case resetSettings:
+         return context.localization.resetSettingsTitle;
+       case donate:
+@@ -92,8 +98,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen>
+   @override
+   String get routeName => Routes.settings.name;
+ 
++  // Battery settings change Android system settings.
++  static final List<_SettingsDisplayItems> _displayItems = [
++    for (final item in _SettingsDisplayItems.values)
++      if (item != _SettingsDisplayItems.battery ||
++          (!kIsWeb && Platform.isAndroid))
++        item,
++  ];
++
+   @override
+-  List<_SettingsDisplayItems> get displayItems => _SettingsDisplayItems.values;
++  List<_SettingsDisplayItems> get displayItems => _displayItems;
+ 
+   @override
+   Future<void> onSelectPressed() =>
+@@ -177,6 +191,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen>
+       case _SettingsDisplayItems.librarySettings:
+         context.goNamed(Routes.librarySettings.name);
+         break;
++      case _SettingsDisplayItems.battery:
++        context.goNamed(Routes.batterySettings.name);
++        break;
+       case _SettingsDisplayItems.resetSettings:
+         await ref
+             .read(settingsPreferencesControllerProvider.notifier)
+@@ -309,6 +326,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen>
+         ref.read(splitScreenControllerProvider.notifier).changeSplitScreenType =
+             SplitScreenType.librarySettings;
+         break;
++      case _SettingsDisplayItems.battery:
++        ref.read(splitScreenControllerProvider.notifier).changeSplitScreenType =
++            SplitScreenType.batterySettings;
++        break;
+       case _SettingsDisplayItems.resetSettings:
+         ref.read(splitScreenControllerProvider.notifier).changeSplitScreenType =
+             SplitScreenType.resetSettings;
+diff --git a/lib/features/status_bar/controller/battery_controller.dart b/lib/features/status_bar/controller/battery_controller.dart
+index a6af3e8..90b4f7b 100644
+--- a/lib/features/status_bar/controller/battery_controller.dart
++++ b/lib/features/status_bar/controller/battery_controller.dart
+@@ -1,25 +1,93 @@
++import 'dart:async';
++import 'dart:io';
++
+ import 'package:battery_plus/battery_plus.dart';
++import 'package:classipod/features/settings/controller/battery_settings_controller.dart';
++import 'package:classipod/features/status_bar/model/android_battery_state.dart';
+ import 'package:classipod/features/status_bar/model/battery_model.dart';
++import 'package:classipod_power/classipod_power.dart';
++import 'package:flutter/foundation.dart';
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ 
+-class BatteryDetailsControllerNotifier extends AsyncNotifier<BatteryModel> {
+-  final Battery _battery = Battery();
+-
+-  @override
+-  Future<BatteryModel> build() async {
+-    ref.watch(onBatteryStateChangeProvider);
+-    return BatteryModel(
+-      level: await _battery.batteryLevel,
+-      batteryState: await _battery.batteryState,
++final batteryDetailsControllerProvider = StreamProvider<BatteryModel>((ref) {
++  if (!kIsWeb && Platform.isAndroid) {
++    return androidBatteryModels(
++      current: ClassipodPower.battery,
++      changes: ClassipodPower.batteryChanges,
++      chargeLimit: ref.watch(batteryCareChargeLimitProvider),
+     );
+   }
+-}
+-
+-final onBatteryStateChangeProvider = StreamProvider<BatteryState>((ref) {
+-  return Battery().onBatteryStateChanged;
++  return _batteryPlusModels();
+ });
+ 
+-final batteryDetailsControllerProvider =
+-    AsyncNotifierProvider<BatteryDetailsControllerNotifier, BatteryModel>(() {
+-      return BatteryDetailsControllerNotifier();
++/// Status bar state from Android's battery broadcast.
++///
++/// [current] seeds the state because [changes] is shared and only replays
++/// the sticky broadcast to its first listener. The state is re-checked every
++/// [recheckEvery] so a stalled charge shows even without new broadcasts.
++Stream<BatteryModel> androidBatteryModels({
++  required Future<AndroidBatterySnapshot> Function() current,
++  required Stream<AndroidBatterySnapshot> changes,
++  int? chargeLimit,
++  Duration recheckEvery = const Duration(minutes: 1),
++  DateTime Function() clock = DateTime.now,
++}) {
++  final progress = ChargeProgress();
++  StreamSubscription<AndroidBatterySnapshot>? subscription;
++  Timer? timer;
++  AndroidBatterySnapshot? latest;
++  late final StreamController<BatteryModel> controller;
++
++  void emit(AndroidBatterySnapshot snapshot) {
++    latest = snapshot;
++    controller.add(
++      BatteryModel(
++        level: snapshot.level.clamp(0, 100),
++        batteryState: batteryStateFromAndroid(
++          snapshot,
++          chargeLimit: chargeLimit,
++          stalled: progress.isStalled(snapshot, clock()),
++        ),
++      ),
++    );
++  }
++
++  void startTimer() {
++    timer = Timer.periodic(recheckEvery, (_) {
++      final snapshot = latest;
++      if (snapshot != null) emit(snapshot);
+     });
++  }
++
++  controller = StreamController<BatteryModel>(
++    onListen: () {
++      subscription = changes.listen(emit, onError: controller.addError);
++      unawaited(
++        current().then((snapshot) {
++          if (latest == null) emit(snapshot);
++        }, onError: controller.addError),
++      );
++      startTimer();
++    },
++    onPause: () => timer?.cancel(),
++    onResume: startTimer,
++    onCancel: () async {
++      timer?.cancel();
++      await subscription?.cancel();
++    },
++  );
++  return controller.stream.distinct();
++}
++
++/// Platforms other than Android. Level is re-read on each state change.
++Stream<BatteryModel> _batteryPlusModels() async* {
++  final battery = Battery();
++  Future<BatteryModel> read() async => BatteryModel(
++    level: await battery.batteryLevel,
++    batteryState: await battery.batteryState,
++  );
++  yield await read();
++  await for (final _ in battery.onBatteryStateChanged.handleError((_) {})) {
++    yield await read();
++  }
++}
+diff --git a/lib/features/status_bar/model/android_battery_state.dart b/lib/features/status_bar/model/android_battery_state.dart
+new file mode 100644
+index 0000000..5a3b0f0
+--- /dev/null
++++ b/lib/features/status_bar/model/android_battery_state.dart
+@@ -0,0 +1,67 @@
++import 'package:battery_plus/battery_plus.dart';
++import 'package:classipod_power/classipod_power.dart';
++
++/// Maps Android's battery broadcast to the state the status bar shows.
++///
++/// The plug flags decide first: with nothing plugged in the battery cannot
++/// be charging, whatever the status field says. A plugged-in battery that
++/// has reached [chargeLimit] (Sony's Battery Care) or has [stalled] is only
++/// being held, so it counts as not charging.
++BatteryState batteryStateFromAndroid(
++  AndroidBatterySnapshot snapshot, {
++  int? chargeLimit,
++  bool stalled = false,
++}) {
++  if (!snapshot.isPluggedIn) return BatteryState.discharging;
++  switch (snapshot.status) {
++    case AndroidBatterySnapshot.statusCharging:
++      final atLimit = chargeLimit != null && snapshot.level >= chargeLimit;
++      if (stalled || atLimit) return BatteryState.connectedNotCharging;
++      return BatteryState.charging;
++    case AndroidBatterySnapshot.statusFull:
++      return BatteryState.full;
++    default:
++      return BatteryState.connectedNotCharging;
++  }
++}
++
++/// Watches whether the level actually rises while Android says "charging".
++///
++/// Android can report charging while USB power is present even though the
++/// battery isn't gaining: held at the Battery Care limit, or with the screen
++/// drawing more than a weak USB port supplies.
++class ChargeProgress {
++  ChargeProgress({this.stallAfter = const Duration(minutes: 15)});
++
++  /// Even a 500 mA port adds 1% in under 5 minutes, so no rise for this
++  /// long means the battery is not gaining charge.
++  final Duration stallAfter;
++
++  int? _level;
++  DateTime? _since;
++  bool _falling = false;
++
++  bool isStalled(AndroidBatterySnapshot snapshot, DateTime now) {
++    if (!snapshot.isPluggedIn ||
++        snapshot.status != AndroidBatterySnapshot.statusCharging ||
++        snapshot.level < 0) {
++      _level = null;
++      _since = null;
++      _falling = false;
++      return false;
++    }
++    final last = _level;
++    if (last == null || snapshot.level > last) {
++      _level = snapshot.level;
++      _since = now;
++      _falling = false;
++      return false;
++    }
++    if (snapshot.level < last) {
++      _level = snapshot.level;
++      _since = now;
++      _falling = true;
++    }
++    return _falling || now.difference(_since!) >= stallAfter;
++  }
++}
+diff --git a/lib/features/status_bar/widgets/device_screen_content.dart b/lib/features/status_bar/widgets/device_screen_content.dart
+index b11da78..25484a2 100644
+--- a/lib/features/status_bar/widgets/device_screen_content.dart
++++ b/lib/features/status_bar/widgets/device_screen_content.dart
+@@ -236,6 +236,7 @@ class _DeviceScreenContentState extends ConsumerState<DeviceScreenContent>
+     Routes.musicMenu.name,
+     Routes.settings.name,
+     Routes.librarySettings.name,
++    Routes.batterySettings.name,
+     Routes.language.name,
+     Routes.deviceColor.name,
+     Routes.sleepTimer.name,
+diff --git a/lib/l10n/app_en.arb b/lib/l10n/app_en.arb
+index 36e369c..4bd0b39 100644
+--- a/lib/l10n/app_en.arb
++++ b/lib/l10n/app_en.arb
+@@ -722,5 +722,113 @@
+   "coverFlowBigTitle": "Big",
+   "@coverFlowBigTitle": {
+     "description": "The Cover Flow appearance option with larger album artwork, showing a centered cover and one tilted cover on each side, up to three covers total"
++  },
++  "batterySettingsScreenTitle": "Battery",
++  "@batterySettingsScreenTitle": {
++    "description": "The title of the Android battery settings page"
++  },
++  "batterySettingsDescription": "Battery Saver, Battery Care and other power settings.",
++  "@batterySettingsDescription": {
++    "description": "The split-screen preview description for Battery settings"
++  },
++  "batteryStatusTitle": "Status",
++  "@batteryStatusTitle": {
++    "description": "The battery settings row showing whether the device is charging"
++  },
++  "batteryStatusCharging": "Charging",
++  "@batteryStatusCharging": {
++    "description": "Battery status while the battery is gaining charge"
++  },
++  "batteryStatusCharged": "Charged",
++  "@batteryStatusCharged": {
++    "description": "Battery status when plugged in and fully charged"
++  },
++  "batteryStatusNotCharging": "Not Charging",
++  "@batteryStatusNotCharging": {
++    "description": "Battery status when plugged in but the battery is not gaining charge, for example held by Battery Care"
++  },
++  "batteryStatusOnBattery": "On Battery",
++  "@batteryStatusOnBattery": {
++    "description": "Battery status when nothing is plugged in"
++  },
++  "batteryStatusDescription": "{level}% · Select to see battery usage.",
++  "@batteryStatusDescription": {
++    "description": "The split-screen preview for the battery status row",
++    "placeholders": {
++      "level": {
++        "type": "int"
++      }
++    }
++  },
++  "batterySaverTitle": "Battery Saver",
++  "@batterySaverTitle": {
++    "description": "The setting that turns Android Battery Saver on or off"
++  },
++  "batterySaverDescription": "Limits background activity to make the battery last longer.",
++  "@batterySaverDescription": {
++    "description": "The split-screen preview description for Battery Saver"
++  },
++  "batteryCareTitle": "Battery Care",
++  "@batteryCareTitle": {
++    "description": "Sony's setting that stops charging at about 90% to slow battery wear"
++  },
++  "batteryCareDescription": "Stops charging at about 90% to slow battery wear.",
++  "@batteryCareDescription": {
++    "description": "The split-screen preview description for Battery Care when Classipod can switch it"
++  },
++  "batteryCareOpensSystemDescription": "Stops charging at about 90% to slow battery wear. Opens the system Battery page.",
++  "@batteryCareOpensSystemDescription": {
++    "description": "The split-screen preview description for Battery Care when it has to be changed in the system Battery page"
++  },
++  "bluetoothScanningTitle": "Bluetooth Scanning",
++  "@bluetoothScanningTitle": {
++    "description": "The setting that lets apps scan for Bluetooth devices while Bluetooth is off"
++  },
++  "bluetoothScanningDescription": "Lets apps look for Bluetooth devices even when Bluetooth is off. Turn off to save power.",
++  "@bluetoothScanningDescription": {
++    "description": "The split-screen preview description for Bluetooth Scanning"
++  },
++  "screenTimeoutTitle": "Screen Timeout",
++  "@screenTimeoutTitle": {
++    "description": "The setting for how long the screen stays on without input"
++  },
++  "screenTimeoutDescription": "How long the screen stays on without input.",
++  "@screenTimeoutDescription": {
++    "description": "The split-screen preview description for Screen Timeout"
++  },
++  "screenTimeoutSeconds": "{seconds} Seconds",
++  "@screenTimeoutSeconds": {
++    "description": "A screen timeout duration in seconds",
++    "placeholders": {
++      "seconds": {
++        "type": "int"
++      }
++    }
++  },
++  "screenTimeoutMinutes": "{minutes, plural, =1{1 Minute} other{{minutes} Minutes}}",
++  "@screenTimeoutMinutes": {
++    "description": "A screen timeout duration in minutes",
++    "placeholders": {
++      "minutes": {
++        "type": "int"
++      }
++    }
++  },
++  "allowSystemChangesTitle": "Allow Changes",
++  "@allowSystemChangesTitle": {
++    "description": "The battery settings row that explains how to let Classipod change system settings"
++  },
++  "allowSystemChangesDescription": "Android only lets Classipod change these settings after a one-time permission. With the device connected to a computer with USB debugging on, run:\n\nadb shell pm grant {packageName} android.permission.WRITE_SECURE_SETTINGS",
++  "@allowSystemChangesDescription": {
++    "description": "The dialog explaining the one-time adb command; adb is Android Debug Bridge and must not be translated, nor the command",
++    "placeholders": {
++      "packageName": {
++        "type": "String"
++      }
++    }
++  },
++  "systemSettingChangeFailed": "Android did not accept the change.",
++  "@systemSettingChangeFailed": {
++    "description": "Shown when Android rejects a battery setting change"
+   }
+ }
+diff --git a/packages/classipod_power/android/build.gradle.kts b/packages/classipod_power/android/build.gradle.kts
+new file mode 100644
+index 0000000..98f5f7b
+--- /dev/null
++++ b/packages/classipod_power/android/build.gradle.kts
+@@ -0,0 +1,68 @@
++group = "com.adeeteya.classipod.power"
++version = "1.0"
++
++buildscript {
++    val kotlinVersion = "2.2.0"
++
++    repositories {
++        google()
++        mavenCentral()
++    }
++
++    dependencies {
++        classpath("com.android.tools.build:gradle:8.12.1")
++        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
++    }
++}
++
++allprojects {
++    repositories {
++        google()
++        mavenCentral()
++    }
++}
++
++plugins {
++    id("com.android.library")
++}
++
++val agpMajor = com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION
++    .substringBefore('.')
++    .toInt()
++
++// Same switch as battery_plus: AGP 9 compiles Kotlin itself unless the app
++// sets android.builtInKotlin=false.
++val builtInKotlinEnabled =
++    agpMajor >= 9 &&
++        (providers.gradleProperty("android.builtInKotlin").orNull?.toBoolean()
++            ?: true)
++
++if (!builtInKotlinEnabled) {
++    apply(plugin = "org.jetbrains.kotlin.android")
++}
++
++project.extensions.configure(
++    org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjectExtension::class.java,
++) {
++    compilerOptions {
++        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
++    }
++}
++
++android {
++    namespace = "com.adeeteya.classipod.power"
++    compileSdk = flutter.compileSdkVersion
++
++    compileOptions {
++        sourceCompatibility = JavaVersion.VERSION_17
++        targetCompatibility = JavaVersion.VERSION_17
++    }
++
++    defaultConfig {
++        minSdk = 21
++    }
++}
++
++dependencies {
++    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.0")
++}
+diff --git a/packages/classipod_power/android/settings.gradle.kts b/packages/classipod_power/android/settings.gradle.kts
+new file mode 100644
+index 0000000..2e686a7
+--- /dev/null
++++ b/packages/classipod_power/android/settings.gradle.kts
+@@ -0,0 +1 @@
++rootProject.name = "classipod_power"
+diff --git a/packages/classipod_power/android/src/main/AndroidManifest.xml b/packages/classipod_power/android/src/main/AndroidManifest.xml
+new file mode 100644
+index 0000000..94cbbcf
+--- /dev/null
++++ b/packages/classipod_power/android/src/main/AndroidManifest.xml
+@@ -0,0 +1 @@
++<manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+diff --git a/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt b/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt
+new file mode 100644
+index 0000000..20eee5f
+--- /dev/null
++++ b/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt
+@@ -0,0 +1,248 @@
++package com.adeeteya.classipod.power
++
++import android.Manifest
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.content.pm.PackageManager
++import android.net.Uri
++import android.os.BatteryManager
++import android.os.Build
++import android.os.PowerManager
++import android.provider.Settings
++import io.flutter.embedding.engine.plugins.FlutterPlugin
++import io.flutter.plugin.common.EventChannel
++import io.flutter.plugin.common.MethodCall
++import io.flutter.plugin.common.MethodChannel
++
++/**
++ * Battery and power settings for Classipod.
++ *
++ * Battery state comes from the sticky ACTION_BATTERY_CHANGED broadcast, the
++ * same source the system status bar uses, because it carries the plug flags
++ * as well as the status. battery_plus only asks the battery HAL for
++ * BATTERY_PROPERTY_STATUS, bypassing the framework.
++ */
++class ClassipodPowerPlugin :
++    FlutterPlugin,
++    MethodChannel.MethodCallHandler,
++    EventChannel.StreamHandler {
++    private var context: Context? = null
++    private var methodChannel: MethodChannel? = null
++    private var batteryChannel: EventChannel? = null
++    private var batteryReceiver: BroadcastReceiver? = null
++
++    override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
++        context = binding.applicationContext
++        methodChannel = MethodChannel(binding.binaryMessenger, "classipod/power")
++            .also { it.setMethodCallHandler(this) }
++        batteryChannel = EventChannel(binding.binaryMessenger, "classipod/power/battery")
++            .also { it.setStreamHandler(this) }
++    }
++
++    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
++        stopBatteryUpdates()
++        methodChannel?.setMethodCallHandler(null)
++        methodChannel = null
++        batteryChannel?.setStreamHandler(null)
++        batteryChannel = null
++        context = null
++    }
++
++    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
++        val ctx = context
++        if (ctx == null) {
++            result.error("UNAVAILABLE", "Plugin is detached", null)
++            return
++        }
++        when (call.method) {
++            "getBattery" -> {
++                val intent = registerBatteryReceiver(ctx, null)
++                if (intent == null) {
++                    result.error("UNAVAILABLE", "No battery broadcast yet", null)
++                } else {
++                    result.success(batterySnapshot(intent))
++                }
++            }
++
++            "getPackageName" -> result.success(ctx.packageName)
++
++            "canWriteSecureSettings" -> result.success(canWriteSecureSettings(ctx))
++
++            "isPowerSaveMode" -> {
++                val power = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
++                result.success(power.isPowerSaveMode)
++            }
++
++            "getSettings" -> {
++                val keys = call.argument<List<Map<String, String>>>("keys").orEmpty()
++                result.success(keys.associate { entry ->
++                    val namespace = entry["namespace"].orEmpty()
++                    val key = entry["key"].orEmpty()
++                    "$namespace/$key" to readSetting(ctx, namespace, key)
++                })
++            }
++
++            "findSettings" -> {
++                val pattern = call.argument<String>("pattern").orEmpty()
++                result.success(findSettings(ctx, Regex(pattern, RegexOption.IGNORE_CASE)))
++            }
++
++            "openSystemScreen" -> {
++                val action = when (call.argument<String>("screen")) {
++                    "battery" -> Intent.ACTION_POWER_USAGE_SUMMARY
++                    "batterySaver" -> Settings.ACTION_BATTERY_SAVER_SETTINGS
++                    else -> Settings.ACTION_SETTINGS
++                }
++                result.success(startSettingsActivity(ctx, action))
++            }
++
++            "putSetting" -> {
++                val namespace = call.argument<String>("namespace").orEmpty()
++                val key = call.argument<String>("key").orEmpty()
++                val value = call.argument<String>("value")
++                try {
++                    result.success(writeSetting(ctx, namespace, key, value))
++                } catch (e: SecurityException) {
++                    result.error("PERMISSION_DENIED", e.message, null)
++                } catch (e: IllegalArgumentException) {
++                    // SettingsProvider rejects private keys without the grant.
++                    result.error("PERMISSION_DENIED", e.message, null)
++                }
++            }
++
++            else -> result.notImplemented()
++        }
++    }
++
++    override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
++        val ctx = context
++        if (ctx == null) {
++            events.error("UNAVAILABLE", "Plugin is detached", null)
++            return
++        }
++        stopBatteryUpdates()
++        val receiver = object : BroadcastReceiver() {
++            override fun onReceive(context: Context, intent: Intent) {
++                events.success(batterySnapshot(intent))
++            }
++        }
++        batteryReceiver = receiver
++        // The broadcast is sticky, so the receiver gets the current value
++        // straight away.
++        registerBatteryReceiver(ctx, receiver)
++    }
++
++    override fun onCancel(arguments: Any?) {
++        stopBatteryUpdates()
++    }
++
++    private fun stopBatteryUpdates() {
++        val receiver = batteryReceiver ?: return
++        batteryReceiver = null
++        try {
++            context?.unregisterReceiver(receiver)
++        } catch (_: IllegalArgumentException) {
++            // Already unregistered.
++        }
++    }
++
++    private fun registerBatteryReceiver(ctx: Context, receiver: BroadcastReceiver?): Intent? {
++        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
++        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
++        } else {
++            ctx.registerReceiver(receiver, filter)
++        }
++    }
++
++    private fun batterySnapshot(intent: Intent): Map<String, Int> {
++        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
++        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
++        return mapOf(
++            "level" to if (level >= 0 && scale > 0) Math.round(level * 100f / scale) else -1,
++            "status" to intent.getIntExtra(
++                BatteryManager.EXTRA_STATUS,
++                BatteryManager.BATTERY_STATUS_UNKNOWN,
++            ),
++            "plugged" to intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0),
++        )
++    }
++
++    private fun canWriteSecureSettings(ctx: Context): Boolean =
++        ctx.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
++            PackageManager.PERMISSION_GRANTED
++
++    private fun readSetting(ctx: Context, namespace: String, key: String): String? {
++        val resolver = ctx.contentResolver
++        return try {
++            when (namespace) {
++                "global" -> Settings.Global.getString(resolver, key)
++                "secure" -> Settings.Secure.getString(resolver, key)
++                "system" -> Settings.System.getString(resolver, key)
++                else -> null
++            }
++        } catch (_: SecurityException) {
++            null
++        }
++    }
++
++    /** Every row of the three settings tables whose name matches. */
++    private fun findSettings(ctx: Context, name: Regex): List<Map<String, String?>> {
++        val tables = mapOf(
++            "global" to Settings.Global.CONTENT_URI,
++            "secure" to Settings.Secure.CONTENT_URI,
++            "system" to Settings.System.CONTENT_URI,
++        )
++        val found = mutableListOf<Map<String, String?>>()
++        for ((namespace, uri) in tables) {
++            found += try {
++                queryTable(ctx, uri, namespace, name)
++            } catch (_: RuntimeException) {
++                // Android 12+ refuses whole-table reads from apps.
++                emptyList()
++            }
++        }
++        return found
++    }
++
++    private fun queryTable(
++        ctx: Context,
++        uri: Uri,
++        namespace: String,
++        name: Regex,
++    ): List<Map<String, String?>> {
++        val rows = mutableListOf<Map<String, String?>>()
++        val projection = arrayOf(Settings.NameValueTable.NAME, Settings.NameValueTable.VALUE)
++        ctx.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
++            while (cursor.moveToNext()) {
++                val key = cursor.getString(0) ?: continue
++                if (name.containsMatchIn(key)) {
++                    rows += mapOf("namespace" to namespace, "key" to key, "value" to cursor.getString(1))
++                }
++            }
++        }
++        return rows
++    }
++
++    private fun startSettingsActivity(ctx: Context, action: String): Boolean {
++        val intent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++        return try {
++            ctx.startActivity(intent)
++            true
++        } catch (_: RuntimeException) {
++            false
++        }
++    }
++
++    private fun writeSetting(ctx: Context, namespace: String, key: String, value: String?): Boolean {
++        val resolver = ctx.contentResolver
++        return when (namespace) {
++            "global" -> Settings.Global.putString(resolver, key, value)
++            "secure" -> Settings.Secure.putString(resolver, key, value)
++            "system" -> Settings.System.putString(resolver, key, value)
++            else -> false
++        }
++    }
++}
+diff --git a/packages/classipod_power/lib/classipod_power.dart b/packages/classipod_power/lib/classipod_power.dart
+new file mode 100644
+index 0000000..230ec24
+--- /dev/null
++++ b/packages/classipod_power/lib/classipod_power.dart
+@@ -0,0 +1,173 @@
++import 'package:flutter/services.dart';
++
++/// Values from Android's `ACTION_BATTERY_CHANGED` broadcast.
++class AndroidBatterySnapshot {
++  const AndroidBatterySnapshot({
++    required this.level,
++    required this.status,
++    required this.plugged,
++  });
++
++  factory AndroidBatterySnapshot.fromMap(Map<Object?, Object?> map) {
++    return AndroidBatterySnapshot(
++      level: map['level'] as int? ?? -1,
++      status: map['status'] as int? ?? statusUnknown,
++      plugged: map['plugged'] as int? ?? 0,
++    );
++  }
++
++  // BatteryManager.BATTERY_STATUS_*
++  static const int statusUnknown = 1;
++  static const int statusCharging = 2;
++  static const int statusDischarging = 3;
++  static const int statusNotCharging = 4;
++  static const int statusFull = 5;
++
++  // BatteryManager.BATTERY_PLUGGED_*
++  static const int pluggedAc = 1;
++  static const int pluggedUsb = 2;
++  static const int pluggedWireless = 4;
++  static const int pluggedDock = 8;
++
++  /// Charge in percent, or -1 when the system did not report it.
++  final int level;
++
++  /// One of the `status*` constants.
++  final int status;
++
++  /// Bitmask of the `plugged*` constants; 0 means running on battery.
++  final int plugged;
++
++  bool get isPluggedIn => plugged != 0;
++
++  @override
++  bool operator ==(Object other) {
++    return other is AndroidBatterySnapshot &&
++        other.level == level &&
++        other.status == status &&
++        other.plugged == plugged;
++  }
++
++  @override
++  int get hashCode => Object.hash(level, status, plugged);
++
++  @override
++  String toString() {
++    return 'AndroidBatterySnapshot(level: $level, status: $status, '
++        'plugged: $plugged)';
++  }
++}
++
++/// A row in Android's settings provider.
++class SystemSetting {
++  const SystemSetting.global(this.key) : namespace = 'global';
++  const SystemSetting.secure(this.key) : namespace = 'secure';
++  const SystemSetting.system(this.key) : namespace = 'system';
++  const SystemSetting._(this.namespace, this.key);
++
++  final String namespace;
++  final String key;
++
++  String get id => '$namespace/$key';
++
++  Map<String, String> toMap() => {'namespace': namespace, 'key': key};
++
++  @override
++  bool operator ==(Object other) {
++    return other is SystemSetting &&
++        other.namespace == namespace &&
++        other.key == key;
++  }
++
++  @override
++  int get hashCode => Object.hash(namespace, key);
++
++  @override
++  String toString() => id;
++}
++
++/// Android-only. Calls fail with [MissingPluginException] elsewhere.
++class ClassipodPower {
++  const ClassipodPower._();
++
++  static const MethodChannel _methods = MethodChannel('classipod/power');
++  static const EventChannel _batteryEvents = EventChannel(
++    'classipod/power/battery',
++  );
++
++  static Future<AndroidBatterySnapshot> battery() async {
++    final map = await _methods.invokeMapMethod<Object?, Object?>('getBattery');
++    return AndroidBatterySnapshot.fromMap(map ?? const {});
++  }
++
++  /// Every system battery update, starting with the current state for the
++  /// first listener. Shared, because an event channel can only feed one
++  /// native subscription.
++  static final Stream<AndroidBatterySnapshot> batteryChanges = _batteryEvents
++      .receiveBroadcastStream()
++      .map(
++        (event) =>
++            AndroidBatterySnapshot.fromMap(event as Map<Object?, Object?>),
++      );
++
++  static Future<String> packageName() async {
++    return await _methods.invokeMethod<String>('getPackageName') ?? '';
++  }
++
++  /// Whether WRITE_SECURE_SETTINGS has been granted with `adb shell pm grant`.
++  static Future<bool> canWriteSecureSettings() async {
++    return await _methods.invokeMethod<bool>('canWriteSecureSettings') ?? false;
++  }
++
++  static Future<bool> isPowerSaveMode() async {
++    return await _methods.invokeMethod<bool>('isPowerSaveMode') ?? false;
++  }
++
++  static Future<Map<SystemSetting, String?>> getSettings(
++    Iterable<SystemSetting> settings,
++  ) async {
++    final list = settings.toList();
++    final values = await _methods.invokeMapMethod<String, String?>(
++      'getSettings',
++      {
++        'keys': [for (final setting in list) setting.toMap()],
++      },
++    );
++    return {for (final setting in list) setting: values?[setting.id]};
++  }
++
++  /// Settings whose key matches [pattern], case-insensitively, with their
++  /// current values. Empty on Android 12 and later, which block the scan.
++  static Future<Map<SystemSetting, String?>> findSettings(
++    String pattern,
++  ) async {
++    final rows =
++        await _methods.invokeListMethod<Map<Object?, Object?>>('findSettings', {
++          'pattern': pattern,
++        }) ??
++        const [];
++    return {
++      for (final row in rows)
++        SystemSetting._(row['namespace']! as String, row['key']! as String):
++            row['value'] as String?,
++    };
++  }
++
++  /// Opens a system settings page. [screen] is `battery` or `batterySaver`.
++  static Future<bool> openSystemScreen(String screen) async {
++    return await _methods.invokeMethod<bool>('openSystemScreen', {
++          'screen': screen,
++        }) ??
++        false;
++  }
++
++  /// Throws a [PlatformException] with code `PERMISSION_DENIED` when the
++  /// system refuses the write.
++  static Future<bool> putSetting(SystemSetting setting, String? value) async {
++    return await _methods.invokeMethod<bool>('putSetting', {
++          ...setting.toMap(),
++          'value': value,
++        }) ??
++        false;
++  }
++}
+diff --git a/packages/classipod_power/pubspec.yaml b/packages/classipod_power/pubspec.yaml
+new file mode 100644
+index 0000000..388bae3
+--- /dev/null
++++ b/packages/classipod_power/pubspec.yaml
+@@ -0,0 +1,19 @@
++name: classipod_power
++description: "Charger state and system power settings for Classipod on Android."
++version: 1.0.0
++publish_to: 'none'
++
++environment:
++  sdk: ^3.13.2
++  flutter: ">=3.47.0"
++
++dependencies:
++  flutter:
++    sdk: flutter
++
++flutter:
++  plugin:
++    platforms:
++      android:
++        package: com.adeeteya.classipod.power
++        pluginClass: ClassipodPowerPlugin
+diff --git a/pubspec.lock b/pubspec.lock
+index f28ce3f..81d9b2b 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -217,6 +217,13 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "2.0.4"
++  classipod_power:
++    dependency: "direct main"
++    description:
++      path: "packages/classipod_power"
++      relative: true
++    source: path
++    version: "1.0.0"
+   clock:
+     dependency: transitive
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 1c1a7ec..b90ffca 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -14,6 +14,8 @@ dependencies:
+   audio_service_mpris: ^0.2.1
+   audio_service_win: ^0.0.3
+   battery_plus: ^7.1.2
++  classipod_power:
++    path: packages/classipod_power
+   crypto: ^3.0.7
+   cupertino_icons: ^2.0.0
+   cupertino_ui: ^1.1.1
+diff --git a/test/unit_tests/features/settings/battery_care_setting_test.dart b/test/unit_tests/features/settings/battery_care_setting_test.dart
+new file mode 100644
+index 0000000..8f208e8
+--- /dev/null
++++ b/test/unit_tests/features/settings/battery_care_setting_test.dart
+@@ -0,0 +1,62 @@
++import 'package:classipod/features/settings/controller/battery_settings_controller.dart';
++import 'package:classipod_power/classipod_power.dart';
++import 'package:flutter_test/flutter_test.dart';
++
++void main() {
++  group('batteryCarePattern', () {
++    final pattern = RegExp(
++      BatterySettingsController.batteryCarePattern,
++      caseSensitive: false,
++    );
++
++    test('matches likely Battery Care keys', () {
++      for (final key in [
++        'battery_care',
++        'BatteryCare',
++        'somc.battery_care_enabled',
++        'charge_limit',
++        'charging_care',
++        'battery_protection',
++      ]) {
++        expect(pattern.hasMatch(key), isTrue, reason: key);
++      }
++    });
++
++    test('ignores unrelated battery keys', () {
++      for (final key in [
++        'low_power',
++        'battery_percentage',
++        'ble_scan_always_enabled',
++        'stay_on_while_plugged_in',
++        'adaptive_battery_management_enabled',
++      ]) {
++        expect(pattern.hasMatch(key), isFalse, reason: key);
++      }
++    });
++  });
++
++  group('pickBatteryCareSetting', () {
++    test('prefers an on/off key named care', () {
++      final picked = pickBatteryCareSetting({
++        const SystemSetting.global('charge_limit'): '1',
++        const SystemSetting.system('battery_care'): '0',
++      });
++      expect(picked?.key, const SystemSetting.system('battery_care'));
++      expect(picked?.value, '0');
++    });
++
++    test('skips values that are not on/off', () {
++      expect(
++        pickBatteryCareSetting({
++          const SystemSetting.global('charge_limit'): '90',
++          const SystemSetting.global('battery_care_mode'): null,
++        }),
++        isNull,
++      );
++    });
++
++    test('nothing found', () {
++      expect(pickBatteryCareSetting({}), isNull);
++    });
++  });
++}
+diff --git a/test/unit_tests/features/status_bar/android_battery_state_test.dart b/test/unit_tests/features/status_bar/android_battery_state_test.dart
+new file mode 100644
+index 0000000..7a143fb
+--- /dev/null
++++ b/test/unit_tests/features/status_bar/android_battery_state_test.dart
+@@ -0,0 +1,203 @@
++import 'dart:async';
++
++import 'package:battery_plus/battery_plus.dart';
++import 'package:classipod/features/status_bar/controller/battery_controller.dart';
++import 'package:classipod/features/status_bar/model/android_battery_state.dart';
++import 'package:classipod/features/status_bar/model/battery_model.dart';
++import 'package:classipod_power/classipod_power.dart';
++import 'package:flutter_test/flutter_test.dart';
++
++AndroidBatterySnapshot _snapshot({
++  int level = 50,
++  int status = AndroidBatterySnapshot.statusCharging,
++  int plugged = AndroidBatterySnapshot.pluggedUsb,
++}) {
++  return AndroidBatterySnapshot(level: level, status: status, plugged: plugged);
++}
++
++void main() {
++  group('batteryStateFromAndroid', () {
++    test('unplugged is never charging, even if status says so', () {
++      expect(
++        batteryStateFromAndroid(_snapshot(plugged: 0)),
++        BatteryState.discharging,
++      );
++      expect(
++        batteryStateFromAndroid(
++          _snapshot(plugged: 0, status: AndroidBatterySnapshot.statusFull),
++        ),
++        BatteryState.discharging,
++      );
++    });
++
++    test('plugged in and charging', () {
++      expect(batteryStateFromAndroid(_snapshot()), BatteryState.charging);
++      expect(
++        batteryStateFromAndroid(
++          _snapshot(plugged: AndroidBatterySnapshot.pluggedAc),
++        ),
++        BatteryState.charging,
++      );
++    });
++
++    test('plugged in but idle', () {
++      for (final status in [
++        AndroidBatterySnapshot.statusNotCharging,
++        AndroidBatterySnapshot.statusDischarging,
++        AndroidBatterySnapshot.statusUnknown,
++      ]) {
++        expect(
++          batteryStateFromAndroid(_snapshot(status: status)),
++          BatteryState.connectedNotCharging,
++        );
++      }
++      expect(
++        batteryStateFromAndroid(
++          _snapshot(status: AndroidBatterySnapshot.statusFull),
++        ),
++        BatteryState.full,
++      );
++    });
++
++    test('stalled charge counts as not charging', () {
++      expect(
++        batteryStateFromAndroid(_snapshot(), stalled: true),
++        BatteryState.connectedNotCharging,
++      );
++    });
++
++    test('charge limit reached counts as not charging', () {
++      expect(
++        batteryStateFromAndroid(_snapshot(level: 90), chargeLimit: 90),
++        BatteryState.connectedNotCharging,
++      );
++      expect(
++        batteryStateFromAndroid(_snapshot(level: 89), chargeLimit: 90),
++        BatteryState.charging,
++      );
++      expect(
++        batteryStateFromAndroid(_snapshot(level: -1), chargeLimit: 90),
++        BatteryState.charging,
++      );
++    });
++  });
++
++  group('ChargeProgress', () {
++    final start = DateTime(2026, 10, 3, 12);
++
++    test('rising level keeps charging', () {
++      final progress = ChargeProgress();
++      expect(progress.isStalled(_snapshot(level: 60), start), isFalse);
++      expect(
++        progress.isStalled(
++          _snapshot(level: 61),
++          start.add(const Duration(minutes: 14)),
++        ),
++        isFalse,
++      );
++      expect(
++        progress.isStalled(
++          _snapshot(level: 61),
++          start.add(const Duration(minutes: 28)),
++        ),
++        isFalse,
++      );
++    });
++
++    test('no rise for the stall window is stalled', () {
++      final progress = ChargeProgress();
++      expect(progress.isStalled(_snapshot(level: 90), start), isFalse);
++      expect(
++        progress.isStalled(
++          _snapshot(level: 90),
++          start.add(const Duration(minutes: 15)),
++        ),
++        isTrue,
++      );
++      expect(
++        progress.isStalled(
++          _snapshot(level: 91),
++          start.add(const Duration(minutes: 16)),
++        ),
++        isFalse,
++      );
++    });
++
++    test('falling level while plugged in is stalled at once', () {
++      final progress = ChargeProgress();
++      expect(progress.isStalled(_snapshot(level: 70), start), isFalse);
++      final later = start.add(const Duration(minutes: 1));
++      expect(progress.isStalled(_snapshot(level: 69), later), isTrue);
++      expect(progress.isStalled(_snapshot(level: 69), later), isTrue);
++      expect(
++        progress.isStalled(
++          _snapshot(level: 70),
++          later.add(const Duration(minutes: 3)),
++        ),
++        isFalse,
++      );
++    });
++
++    test('unplugging resets the tracking', () {
++      final progress = ChargeProgress();
++      progress.isStalled(_snapshot(level: 80), start);
++      progress.isStalled(
++        _snapshot(level: 79),
++        start.add(const Duration(minutes: 1)),
++      );
++      expect(
++        progress.isStalled(
++          _snapshot(level: 79, plugged: 0),
++          start.add(const Duration(minutes: 2)),
++        ),
++        isFalse,
++      );
++      expect(
++        progress.isStalled(
++          _snapshot(level: 79),
++          start.add(const Duration(minutes: 3)),
++        ),
++        isFalse,
++      );
++    });
++  });
++
++  group('androidBatteryModels', () {
++    test('seeds from the current state, then follows changes', () async {
++      final changes = StreamController<AndroidBatterySnapshot>.broadcast();
++      final models = <BatteryModel>[];
++      final subscription = androidBatteryModels(
++        current: () async => _snapshot(level: 40),
++        changes: changes.stream,
++      ).listen(models.add);
++      await pumpEventQueue();
++      changes.add(_snapshot(level: 40, plugged: 0));
++      await pumpEventQueue();
++      await subscription.cancel();
++      await changes.close();
++
++      expect(models, const [
++        BatteryModel(level: 40, batteryState: BatteryState.charging),
++        BatteryModel(level: 40, batteryState: BatteryState.discharging),
++      ]);
++    });
++
++    test('applies the charge limit', () async {
++      final models = <BatteryModel>[];
++      final subscription = androidBatteryModels(
++        current: () async => _snapshot(level: 90),
++        changes: const Stream.empty(),
++        chargeLimit: 90,
++      ).listen(models.add);
++      await pumpEventQueue();
++      await subscription.cancel();
++
++      expect(models, const [
++        BatteryModel(
++          level: 90,
++          batteryState: BatteryState.connectedNotCharging,
++        ),
++      ]);
++    });
++  });
++}
+-- 
+2.43.0
+

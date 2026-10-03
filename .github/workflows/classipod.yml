@@ -1,0 +1,85 @@
+name: Classipod for Walkman
+
+# Builds upstream Classipod with the patches in classipod/patches and uploads
+# the APK as an artifact.
+on:
+  push:
+    paths:
+      - 'classipod/**'
+      - '.github/workflows/classipod.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install native metadata build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Check out Classipod and apply patches
+        run: |
+          git clone https://github.com/adeeteya/classipod.git upstream
+          git -C upstream checkout "$(cat classipod/upstream-commit)"
+          git -C upstream -c user.name=ci -c user.email=ci@localhost \
+            am "$GITHUB_WORKSPACE"/classipod/patches/*.patch
+
+      - name: Analyze and test
+        working-directory: upstream
+        run: |
+          flutter pub get --suppress-analytics
+          flutter gen-l10n
+          flutter analyze --suppress-analytics
+          flutter test --no-pub --suppress-analytics
+
+      # Android only installs an update signed with the same key. Put the key
+      # the installed copy was signed with in the CLASSIPOD_KEYSTORE_BASE64
+      # secret (base64 of ~/.android/debug.keystore for a Mac debug build);
+      # without it a throwaway key is used and the old copy must be
+      # uninstalled first.
+      - name: Set up signing
+        working-directory: upstream
+        env:
+          KEYSTORE_BASE64: ${{ secrets.CLASSIPOD_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.CLASSIPOD_KEY_ALIAS || 'androiddebugkey' }}
+          KEY_PASSWORD: ${{ secrets.CLASSIPOD_KEY_PASSWORD || 'android' }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > android/walkman.jks
+          else
+            echo "::warning::No CLASSIPOD_KEYSTORE_BASE64 secret; signing with a throwaway key."
+            keytool -genkeypair -keystore android/walkman.jks \
+              -storepass "$KEY_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Classipod Walkman CI"
+          fi
+          cat > android/key.properties <<EOF
+          storePassword=$KEY_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=../walkman.jks
+          EOF
+
+      - name: Build APK
+        working-directory: upstream
+        run: flutter build apk --release --flavor production --no-pub --suppress-analytics
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: classipod-walkman
+          path: upstream/build/app/outputs/flutter-apk/app-production-release.apk
+          if-no-files-found: error
