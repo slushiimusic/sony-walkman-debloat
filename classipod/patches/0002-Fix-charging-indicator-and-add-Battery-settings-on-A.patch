@@ -1,7 +1,7 @@
 From 900c366875bfbb8aeb8d05cbf26ba5df4d4a0120 Mon Sep 17 00:00:00 2001
 From: slushiimusic <75352846+slushiimusic@users.noreply.github.com>
 Date: Sat, 3 Oct 2026 08:10:21 +0000
-Subject: [PATCH 2/2] =?UTF-8?q?=F0=9F=90=9B=20Fix=20charging=20indicator?=
+Subject: [PATCH 2/3] =?UTF-8?q?=F0=9F=90=9B=20Fix=20charging=20indicator?=
  =?UTF-8?q?=20and=20add=20Battery=20settings=20on=20Android?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

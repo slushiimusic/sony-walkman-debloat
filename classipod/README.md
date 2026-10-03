@@ -9,6 +9,7 @@ NW-WM1AM2 (Android 11). They apply to upstream commit
 | --- | --- |
 | `0001` | Turns off Impeller, which crashes in the Walkman's Vivante GPU shader compiler. It's the same fix as the hand-patched APK on the device, applied in source. |
 | `0002` | Fixes the charging indicator and adds **Settings > Battery**. |
+| `0003` | Adds **Settings > Home Screen**, for using Classipod as the home screen. |
 
 ## Charging indicator
 
@@ -53,6 +54,22 @@ On first open, the app looks through Android's settings tables for it.
   system Battery page, where Sony's own switch is.
 
 Check once that Sony's Battery page agrees with what Classipod shows.
+
+## Home screen
+
+**Settings > Home Screen** (Android only) is off by default.
+- **Turning it on** shows Android's "Set Classipod as your default home app?"
+  dialog. Confirm it, and Classipod opens at boot, and pressing Home brings
+  you back to its main menu.
+- **Turning it off** hands home back to the Walkman's own launcher.
+
+While Classipod is the home screen, Back on the main menu does nothing.
+Otherwise Android would close Classipod and then reopen it.
+
+Classipod's home entry is a tiny native screen that hands straight over to
+the normal Classipod screen, so only one copy of Classipod runs. If the
+dialog doesn't appear, pick Classipod under Android's **Default apps > Home
+app**.
 
 ## Build and install
 

@@ -1,0 +1,566 @@
+From 1b80a12853569f91c436bfc2dddc920a0fefbbc1 Mon Sep 17 00:00:00 2001
+From: slushiimusic <75352846+slushiimusic@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 08:22:12 +0000
+Subject: [PATCH 3/3] =?UTF-8?q?=E2=9C=A8=20Add=20option=20to=20use=20Class?=
+ =?UTF-8?q?ipod=20as=20the=20home=20screen=20on=20Android?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Settings > Home Screen (Android only) turns it on and off:
+- On enables a HOME activity and asks Android, through the system
+  "default home app" dialog, to make Classipod the home app. Android 9
+  and older open the default home app setting instead.
+- Off disables the activity, and Android falls back to the other
+  launcher.
+
+The HOME activity only forwards to the normal Classipod activity and
+finishes, so the Flutter activity never runs in the home task. That
+keeps one activity on audio_service's shared engine, including when the
+media notification opens the app.
+
+While Classipod is the home app, Home returns to the main menu, and
+Back at the main menu does nothing instead of closing an app Android
+would immediately reopen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Vi6nrnAN1baNYA2a6uHmXt
+---
+ lib/classipod_app.dart                        |   2 +
+ .../menu/models/split_screen_type.dart        |   1 +
+ .../menu/screens/main_menu_screen.dart        |  48 ++++----
+ .../screens/split_screen_placeholder.dart     |   6 +
+ .../controller/home_screen_controller.dart    |  39 +++++++
+ .../screens/settings_preferences_screen.dart  |  18 ++-
+ lib/l10n/app_en.arb                           |   8 ++
+ .../android/src/main/AndroidManifest.xml      |  20 +++-
+ .../classipod/power/ClassipodPowerPlugin.kt   | 107 +++++++++++++++++-
+ .../adeeteya/classipod/power/HomeActivity.kt  |  29 +++++
+ .../classipod_power/lib/classipod_power.dart  |  25 ++++
+ 11 files changed, 278 insertions(+), 25 deletions(-)
+ create mode 100644 lib/features/settings/controller/home_screen_controller.dart
+ create mode 100644 packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/HomeActivity.kt
+
+diff --git a/lib/classipod_app.dart b/lib/classipod_app.dart
+index d7c13b5..bb20fcb 100644
+--- a/lib/classipod_app.dart
++++ b/lib/classipod_app.dart
+@@ -2,6 +2,7 @@ import 'package:classipod/core/extensions/build_context_extensions.dart';
+ import 'package:classipod/core/navigation/routes.dart';
+ import 'package:classipod/core/services/audio_player_service.dart';
+ import 'package:classipod/features/app_startup/controllers/splash_controller.dart';
++import 'package:classipod/features/settings/controller/home_screen_controller.dart';
+ import 'package:classipod/features/settings/controller/settings_preferences_controller.dart';
+ import 'package:classipod/l10n/generated/app_localizations.dart';
+ import 'package:cupertino_ui/cupertino_ui.dart';
+@@ -27,6 +28,7 @@ class ClassipodApp extends ConsumerWidget {
+       settingsPreferencesControllerProvider.select((value) => value.appTheme),
+     );
+     final router = ref.watch(routerProvider);
++    ref.watch(homePressedHandlerProvider);
+     return CupertinoApp.router(
+       onGenerateTitle: (context) => context.localization.appTitle,
+       localizationsDelegates: AppLocalizations.localizationsDelegates,
+diff --git a/lib/features/menu/models/split_screen_type.dart b/lib/features/menu/models/split_screen_type.dart
+index 6f3b46d..d98e07d 100644
+--- a/lib/features/menu/models/split_screen_type.dart
++++ b/lib/features/menu/models/split_screen_type.dart
+@@ -31,6 +31,7 @@ enum SplitScreenType {
+   bluetoothScanning,
+   screenTimeout,
+   allowSystemChanges,
++  homeScreen,
+   excludeDirectories,
+   resetSettings,
+   donate,
+diff --git a/lib/features/menu/screens/main_menu_screen.dart b/lib/features/menu/screens/main_menu_screen.dart
+index f0dc83c..05af2cc 100644
+--- a/lib/features/menu/screens/main_menu_screen.dart
++++ b/lib/features/menu/screens/main_menu_screen.dart
+@@ -8,6 +8,7 @@ import 'package:classipod/core/widgets/display_list_tile.dart';
+ import 'package:classipod/features/custom_screen_elements/custom_screen.dart';
+ import 'package:classipod/features/menu/controller/split_screen_controller.dart';
+ import 'package:classipod/features/menu/models/split_screen_type.dart';
++import 'package:classipod/features/settings/controller/home_screen_controller.dart';
+ import 'package:classipod/features/tutorial/controller/tutorial_controller.dart';
+ import 'package:cupertino_ui/cupertino_ui.dart';
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+@@ -133,31 +134,36 @@ class _MainMenuScreenState extends ConsumerState<MainMenuScreen>
+       unawaited(ref.read(splitScreenViewControllerProvider).openSplitView());
+     }
+ 
+-    return CupertinoPageScaffold(
+-      child: Column(
+-        children: [
+-          Expanded(
+-            child: CupertinoScrollbar(
+-              controller: scrollController,
+-              child: ListView.builder(
++    // Back must not close the home screen; Android would only reopen it.
++    final isHomeScreen = ref.watch(homeScreenControllerProvider).value ?? false;
++    return PopScope(
++      canPop: !isHomeScreen,
++      child: CupertinoPageScaffold(
++        child: Column(
++          children: [
++            Expanded(
++              child: CupertinoScrollbar(
+                 controller: scrollController,
+-                itemCount: displayItems.length,
+-                prototypeItem: const DisplayListTile(
+-                  text: '',
+-                  isSelected: false,
++                child: ListView.builder(
++                  controller: scrollController,
++                  itemCount: displayItems.length,
++                  prototypeItem: const DisplayListTile(
++                    text: '',
++                    isSelected: false,
++                  ),
++                  itemBuilder: (context, index) {
++                    return DisplayListTile(
++                      key: ValueKey(displayItems[index]),
++                      text: displayItems[index].title(context),
++                      isSelected: selectedDisplayItem == index,
++                      onTap: () async => _navigateToScreen(displayItems[index]),
++                    );
++                  },
+                 ),
+-                itemBuilder: (context, index) {
+-                  return DisplayListTile(
+-                    key: ValueKey(displayItems[index]),
+-                    text: displayItems[index].title(context),
+-                    isSelected: selectedDisplayItem == index,
+-                    onTap: () async => _navigateToScreen(displayItems[index]),
+-                  );
+-                },
+               ),
+             ),
+-          ),
+-        ],
++          ],
++        ),
+       ),
+     );
+   }
+diff --git a/lib/features/menu/screens/split_screen_placeholder.dart b/lib/features/menu/screens/split_screen_placeholder.dart
+index 866bd6e..7fb4994 100644
+--- a/lib/features/menu/screens/split_screen_placeholder.dart
++++ b/lib/features/menu/screens/split_screen_placeholder.dart
+@@ -311,6 +311,12 @@ class _SplitScreenPlaceholderState extends ConsumerState<SplitScreenPlaceholder>
+           icon: CupertinoIcons.timer,
+           contentText: context.localization.screenTimeoutDescription,
+         );
++      } else if (splitScreenType == SplitScreenType.homeScreen) {
++        splitScreenWidget = IconPreviewWidget(
++          titleText: context.localization.homeScreenSettingTitle,
++          icon: CupertinoIcons.house_fill,
++          contentText: context.localization.homeScreenSettingDescription,
++        );
+       } else if (splitScreenType == SplitScreenType.allowSystemChanges) {
+         splitScreenWidget = IconPreviewWidget(
+           titleText: context.localization.allowSystemChangesTitle,
+diff --git a/lib/features/settings/controller/home_screen_controller.dart b/lib/features/settings/controller/home_screen_controller.dart
+new file mode 100644
+index 0000000..95ac4c3
+--- /dev/null
++++ b/lib/features/settings/controller/home_screen_controller.dart
+@@ -0,0 +1,39 @@
++import 'dart:io';
++
++import 'package:classipod/core/extensions/go_router_extensions.dart';
++import 'package:classipod/core/navigation/routes.dart';
++import 'package:classipod_power/classipod_power.dart';
++import 'package:flutter/foundation.dart';
++import 'package:flutter/widgets.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++
++/// Whether Classipod is the Android home app.
++final homeScreenControllerProvider =
++    AsyncNotifierProvider<HomeScreenController, bool>(HomeScreenController.new);
++
++class HomeScreenController extends AsyncNotifier<bool> {
++  @override
++  Future<bool> build() async {
++    if (kIsWeb || !Platform.isAndroid) return false;
++    // The default home app can also be changed in system settings.
++    final lifecycle = AppLifecycleListener(onResume: ref.invalidateSelf);
++    ref.onDispose(lifecycle.dispose);
++    return ClassipodPower.isDefaultHome();
++  }
++
++  Future<void> toggle() async {
++    final enabled = await future;
++    state = AsyncData(await ClassipodPower.setHomeScreen(!enabled));
++  }
++}
++
++/// Pressing Home while Classipod is the home app goes back to the menu.
++final homePressedHandlerProvider = Provider<void>((ref) {
++  if (kIsWeb || !Platform.isAndroid) return;
++  final router = ref.watch(routerProvider);
++  ClassipodPower.setHomePressedHandler(() {
++    if (router.locationNamed == Routes.splash.name) return;
++    router.goNamed(Routes.menu.name);
++  });
++  ref.onDispose(() => ClassipodPower.setHomePressedHandler(null));
++});
+diff --git a/lib/features/settings/screens/settings_preferences_screen.dart b/lib/features/settings/screens/settings_preferences_screen.dart
+index 50d7b12..409112a 100644
+--- a/lib/features/settings/screens/settings_preferences_screen.dart
++++ b/lib/features/settings/screens/settings_preferences_screen.dart
+@@ -9,6 +9,7 @@ import 'package:classipod/features/custom_screen_elements/custom_screen.dart';
+ import 'package:classipod/features/menu/controller/split_screen_controller.dart';
+ import 'package:classipod/features/menu/models/split_screen_type.dart';
+ import 'package:classipod/features/now_playing/provider/now_playing_details_provider.dart';
++import 'package:classipod/features/settings/controller/home_screen_controller.dart';
+ import 'package:classipod/features/settings/controller/settings_preferences_controller.dart';
+ import 'package:classipod/features/settings/models/settings_preferences_model.dart';
+ import 'package:classipod/features/settings/widgets/settings_list_tile.dart';
+@@ -37,6 +38,7 @@ enum _SettingsDisplayItems {
+   showAppTutorial,
+   librarySettings,
+   battery,
++  homeScreen,
+   resetSettings,
+   donate;
+ 
+@@ -78,6 +80,8 @@ enum _SettingsDisplayItems {
+         return context.localization.librarySettingsScreenTitle;
+       case battery:
+         return context.localization.batterySettingsScreenTitle;
++      case homeScreen:
++        return context.localization.homeScreenSettingTitle;
+       case resetSettings:
+         return context.localization.resetSettingsTitle;
+       case donate:
+@@ -98,10 +102,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen>
+   @override
+   String get routeName => Routes.settings.name;
+ 
+-  // Battery settings change Android system settings.
++  // Battery and Home Screen change Android system settings.
+   static final List<_SettingsDisplayItems> _displayItems = [
+     for (final item in _SettingsDisplayItems.values)
+-      if (item != _SettingsDisplayItems.battery ||
++      if ((item != _SettingsDisplayItems.battery &&
++              item != _SettingsDisplayItems.homeScreen) ||
+           (!kIsWeb && Platform.isAndroid))
+         item,
+   ];
+@@ -194,6 +199,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen>
+       case _SettingsDisplayItems.battery:
+         context.goNamed(Routes.batterySettings.name);
+         break;
++      case _SettingsDisplayItems.homeScreen:
++        await ref.read(homeScreenControllerProvider.notifier).toggle();
++        break;
+       case _SettingsDisplayItems.resetSettings:
+         await ref
+             .read(settingsPreferencesControllerProvider.notifier)
+@@ -223,6 +231,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen>
+         return settingsState.splitScreenEnabled;
+       case _SettingsDisplayItems.immersiveMode:
+         return settingsState.immersiveMode;
++      case _SettingsDisplayItems.homeScreen:
++        return ref.watch(homeScreenControllerProvider).value ?? false;
+       default:
+         return null;
+     }
+@@ -330,6 +340,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen>
+         ref.read(splitScreenControllerProvider.notifier).changeSplitScreenType =
+             SplitScreenType.batterySettings;
+         break;
++      case _SettingsDisplayItems.homeScreen:
++        ref.read(splitScreenControllerProvider.notifier).changeSplitScreenType =
++            SplitScreenType.homeScreen;
++        break;
+       case _SettingsDisplayItems.resetSettings:
+         ref.read(splitScreenControllerProvider.notifier).changeSplitScreenType =
+             SplitScreenType.resetSettings;
+diff --git a/lib/l10n/app_en.arb b/lib/l10n/app_en.arb
+index 4bd0b39..d7bfda4 100644
+--- a/lib/l10n/app_en.arb
++++ b/lib/l10n/app_en.arb
+@@ -830,5 +830,13 @@
+   "systemSettingChangeFailed": "Android did not accept the change.",
+   "@systemSettingChangeFailed": {
+     "description": "Shown when Android rejects a battery setting change"
++  },
++  "homeScreenSettingTitle": "Home Screen",
++  "@homeScreenSettingTitle": {
++    "description": "The Android setting that makes Classipod the device's home screen app"
++  },
++  "homeScreenSettingDescription": "Use Classipod as the home screen. Home returns to the main menu.",
++  "@homeScreenSettingDescription": {
++    "description": "The split-screen preview description for the Home Screen setting"
+   }
+ }
+diff --git a/packages/classipod_power/android/src/main/AndroidManifest.xml b/packages/classipod_power/android/src/main/AndroidManifest.xml
+index 94cbbcf..03b5555 100644
+--- a/packages/classipod_power/android/src/main/AndroidManifest.xml
++++ b/packages/classipod_power/android/src/main/AndroidManifest.xml
+@@ -1 +1,19 @@
+-<manifest xmlns:android="http://schemas.android.com/apk/res/android" />
++<manifest xmlns:android="http://schemas.android.com/apk/res/android">
++    <application>
++        <!-- Classipod's home screen entry. Disabled until the user turns on
++             Settings > Home Screen; it only forwards to the main activity. -->
++        <activity
++            android:name="com.adeeteya.classipod.power.HomeActivity"
++            android:enabled="false"
++            android:excludeFromRecents="true"
++            android:exported="true"
++            android:noHistory="true"
++            android:theme="@android:style/Theme.NoDisplay">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.HOME" />
++                <category android:name="android.intent.category.DEFAULT" />
++            </intent-filter>
++        </activity>
++    </application>
++</manifest>
+diff --git a/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt b/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt
+index 20eee5f..d485cb4 100644
+--- a/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt
++++ b/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/ClassipodPowerPlugin.kt
+@@ -1,7 +1,10 @@
+ package com.adeeteya.classipod.power
+ 
+ import android.Manifest
++import android.app.Activity
++import android.app.role.RoleManager
+ import android.content.BroadcastReceiver
++import android.content.ComponentName
+ import android.content.Context
+ import android.content.Intent
+ import android.content.IntentFilter
+@@ -12,9 +15,12 @@ import android.os.Build
+ import android.os.PowerManager
+ import android.provider.Settings
+ import io.flutter.embedding.engine.plugins.FlutterPlugin
++import io.flutter.embedding.engine.plugins.activity.ActivityAware
++import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+ import io.flutter.plugin.common.EventChannel
+ import io.flutter.plugin.common.MethodCall
+ import io.flutter.plugin.common.MethodChannel
++import io.flutter.plugin.common.PluginRegistry
+ 
+ /**
+  * Battery and power settings for Classipod.
+@@ -26,12 +32,17 @@ import io.flutter.plugin.common.MethodChannel
+  */
+ class ClassipodPowerPlugin :
+     FlutterPlugin,
++    ActivityAware,
+     MethodChannel.MethodCallHandler,
+-    EventChannel.StreamHandler {
++    EventChannel.StreamHandler,
++    PluginRegistry.ActivityResultListener,
++    PluginRegistry.NewIntentListener {
+     private var context: Context? = null
+     private var methodChannel: MethodChannel? = null
+     private var batteryChannel: EventChannel? = null
+     private var batteryReceiver: BroadcastReceiver? = null
++    private var activityBinding: ActivityPluginBinding? = null
++    private var pendingHomeRequest: MethodChannel.Result? = null
+ 
+     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+         context = binding.applicationContext
+@@ -50,6 +61,38 @@ class ClassipodPowerPlugin :
+         context = null
+     }
+ 
++    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
++        activityBinding = binding
++        binding.addActivityResultListener(this)
++        binding.addOnNewIntentListener(this)
++    }
++
++    override fun onDetachedFromActivityForConfigChanges() = onDetachedFromActivity()
++
++    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) =
++        onAttachedToActivity(binding)
++
++    override fun onDetachedFromActivity() {
++        activityBinding?.removeActivityResultListener(this)
++        activityBinding?.removeOnNewIntentListener(this)
++        activityBinding = null
++    }
++
++    override fun onNewIntent(intent: Intent): Boolean {
++        if (intent.getBooleanExtra(HomeActivity.EXTRA_HOME_PRESSED, false)) {
++            methodChannel?.invokeMethod("homePressed", null)
++        }
++        return false
++    }
++
++    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
++        if (requestCode != REQUEST_HOME_ROLE) return false
++        val ctx = context
++        pendingHomeRequest?.success(ctx != null && isDefaultHome(ctx))
++        pendingHomeRequest = null
++        return true
++    }
++
+     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+         val ctx = context
+         if (ctx == null) {
+@@ -98,6 +141,10 @@ class ClassipodPowerPlugin :
+                 result.success(startSettingsActivity(ctx, action))
+             }
+ 
++            "isDefaultHome" -> result.success(isDefaultHome(ctx))
++
++            "setHomeScreen" -> setHomeScreen(ctx, call.argument<Boolean>("enabled") == true, result)
++
+             "putSetting" -> {
+                 val namespace = call.argument<String>("namespace").orEmpty()
+                 val key = call.argument<String>("key").orEmpty()
+@@ -226,6 +273,60 @@ class ClassipodPowerPlugin :
+         return rows
+     }
+ 
++    /**
++     * Turning on enables [HomeActivity] and asks Android to make Classipod the
++     * default home app. Turning off disables it, and Android falls back to
++     * the other launcher. Replies with whether Classipod is now the home app.
++     */
++    private fun setHomeScreen(ctx: Context, enabled: Boolean, result: MethodChannel.Result) {
++        ctx.packageManager.setComponentEnabledSetting(
++            ComponentName(ctx, HomeActivity::class.java),
++            if (enabled) {
++                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
++            } else {
++                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
++            },
++            PackageManager.DONT_KILL_APP,
++        )
++        if (!enabled || isDefaultHome(ctx)) {
++            result.success(isDefaultHome(ctx))
++            return
++        }
++        val activity: Activity? = activityBinding?.activity
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && activity != null) {
++            val roles = ctx.getSystemService(RoleManager::class.java)
++            if (roles != null && roles.isRoleAvailable(RoleManager.ROLE_HOME)) {
++                pendingHomeRequest?.success(false)
++                pendingHomeRequest = result
++                activity.startActivityForResult(
++                    roles.createRequestRoleIntent(RoleManager.ROLE_HOME),
++                    REQUEST_HOME_ROLE,
++                )
++                return
++            }
++        }
++        // No role dialog before Android 10: let the user pick in Settings.
++        startSettingsActivity(ctx, Settings.ACTION_HOME_SETTINGS)
++        result.success(isDefaultHome(ctx))
++    }
++
++    private fun isDefaultHome(ctx: Context): Boolean {
++        val component = ComponentName(ctx, HomeActivity::class.java)
++        val state = ctx.packageManager.getComponentEnabledSetting(component)
++        if (state != PackageManager.COMPONENT_ENABLED_STATE_ENABLED) return false
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            val roles = ctx.getSystemService(RoleManager::class.java)
++            if (roles != null && roles.isRoleAvailable(RoleManager.ROLE_HOME)) {
++                return roles.isRoleHeld(RoleManager.ROLE_HOME)
++            }
++        }
++        val home = ctx.packageManager.resolveActivity(
++            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
++            PackageManager.MATCH_DEFAULT_ONLY,
++        )
++        return home?.activityInfo?.packageName == ctx.packageName
++    }
++
+     private fun startSettingsActivity(ctx: Context, action: String): Boolean {
+         val intent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+         return try {
+@@ -236,6 +337,10 @@ class ClassipodPowerPlugin :
+         }
+     }
+ 
++    private companion object {
++        const val REQUEST_HOME_ROLE = 0x484f
++    }
++
+     private fun writeSetting(ctx: Context, namespace: String, key: String, value: String?): Boolean {
+         val resolver = ctx.contentResolver
+         return when (namespace) {
+diff --git a/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/HomeActivity.kt b/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/HomeActivity.kt
+new file mode 100644
+index 0000000..4fd988b
+--- /dev/null
++++ b/packages/classipod_power/android/src/main/kotlin/com/adeeteya/classipod/power/HomeActivity.kt
+@@ -0,0 +1,29 @@
++package com.adeeteya.classipod.power
++
++import android.app.Activity
++import android.content.Intent
++import android.os.Bundle
++
++/**
++ * The HOME entry point. It brings up Classipod's normal activity and
++ * finishes, so the Flutter activity never runs in the home task. That keeps
++ * a single activity on audio_service's shared engine, even when the media
++ * notification opens the app.
++ */
++class HomeActivity : Activity() {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        packageManager.getLaunchIntentForPackage(packageName)?.let { launch ->
++            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++            launch.putExtra(EXTRA_HOME_PRESSED, true)
++            startActivity(launch)
++        }
++        finish()
++        @Suppress("DEPRECATION")
++        overridePendingTransition(0, 0)
++    }
++
++    companion object {
++        const val EXTRA_HOME_PRESSED = "com.adeeteya.classipod.power.HOME_PRESSED"
++    }
++}
+diff --git a/packages/classipod_power/lib/classipod_power.dart b/packages/classipod_power/lib/classipod_power.dart
+index 230ec24..0e09ae4 100644
+--- a/packages/classipod_power/lib/classipod_power.dart
++++ b/packages/classipod_power/lib/classipod_power.dart
+@@ -161,6 +161,31 @@ class ClassipodPower {
+         false;
+   }
+ 
++  /// Whether Classipod is the default home app.
++  static Future<bool> isDefaultHome() async {
++    return await _methods.invokeMethod<bool>('isDefaultHome') ?? false;
++  }
++
++  /// Turning on asks Android to make Classipod the default home app, which
++  /// the user confirms in a system dialog. Returns whether it now is.
++  static Future<bool> setHomeScreen(bool enabled) async {
++    return await _methods.invokeMethod<bool>('setHomeScreen', {
++          'enabled': enabled,
++        }) ??
++        false;
++  }
++
++  /// Called when Home is pressed while Classipod is the home app.
++  static void setHomePressedHandler(void Function()? onHomePressed) {
++    _methods.setMethodCallHandler(
++      onHomePressed == null
++          ? null
++          : (call) async {
++              if (call.method == 'homePressed') onHomePressed();
++            },
++    );
++  }
++
+   /// Throws a [PlatformException] with code `PERMISSION_DENIED` when the
+   /// system refuses the write.
+   static Future<bool> putSetting(SystemSetting setting, String? value) async {
+-- 
+2.43.0
+
